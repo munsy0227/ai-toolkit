@@ -525,7 +525,8 @@ def encode_prompts_flux(
             prompt if torch.rand(1).item() > dropout_prob else "" for prompt in prompts
         ]
 
-    device = text_encoder[0].device
+    device     = text_encoder[0].device
+    enc_device = text_encoder[1].device
     dtype = text_encoder[0].dtype
 
     batch_size = len(prompts)
@@ -543,10 +544,15 @@ def encode_prompts_flux(
 
     text_input_ids = text_inputs.input_ids
 
-    prompt_embeds = text_encoder[0](text_input_ids.to(device), output_hidden_states=False)
+    dev0 = text_encoder[0].device
+    clip_out = text_encoder[0](
+        text_input_ids.to(dev0),
+        output_hidden_states=False,
+        return_dict=True          # ★ dict 형태로 받기
+    )
 
-    # Use pooled output of CLIPTextModel
-    pooled_prompt_embeds = prompt_embeds.pooler_output
+    prompt_embeds = clip_out.last_hidden_state                # (B, L, 768)
+    pooled_prompt_embeds = clip_out.pooler_output             # (B, 768)
     pooled_prompt_embeds = pooled_prompt_embeds.to(dtype=dtype, device=device)
 
     # T5
@@ -561,7 +567,8 @@ def encode_prompts_flux(
     )
     text_input_ids = text_inputs.input_ids
 
-    prompt_embeds = text_encoder[1](text_input_ids.to(device), output_hidden_states=False)[0]
+    dev1 = text_encoder[1].device
+    prompt_embeds_2 = text_encoder[1](text_input_ids.to(dev1), output_hidden_states=False)[0]
 
     dtype = text_encoder[1].dtype
     prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)

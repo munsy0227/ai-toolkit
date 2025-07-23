@@ -2,6 +2,11 @@ import os
 from typing import TYPE_CHECKING, List
 
 import torch
+
+torch.backends.cuda.enable_flash_sdp(True)          # ⓐ Flash kernel
+torch.backends.cuda.enable_mem_efficient_sdp(True)  # ⓑ xformers‑style kernel
+torch.backends.cuda.enable_math_sdp(False) 
+
 import torchvision
 import yaml
 from toolkit import train_tools
@@ -22,6 +27,10 @@ from transformers import T5TokenizerFast, T5EncoderModel, CLIPTextModel, CLIPTok
 from einops import rearrange, repeat
 import random
 import torch.nn.functional as F
+from transformers import BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model
+
+conv_regex = r"\.conv\."
 
 if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
@@ -91,26 +100,83 @@ class FluxKontextModel(BaseModel):
             if os.path.exists(te_folder_path):
                 base_model_path = model_path
 
-        self.print_and_status_update("Loading transformer")
+        self.print_and_status_update("Loading 4‑bit NF4 transformer")
+ 
+        bnb_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+         )
+ 
         transformer = FluxTransformer2DModel.from_pretrained(
             transformer_path,
             subfolder=transformer_subfolder,
-            torch_dtype=dtype
-        )
-        transformer.to(self.quantize_device, dtype=dtype)
+            quantization_config=bnb_cfg,               # ★ 핵심
+            device_map={"": self.device_torch},        # GPU 자동 배치
+            torch_dtype=torch.bfloat16,                # 비‑Linear 층 dtype
+         )
 
+        try:
+            transformer.enable_xformers_memory_efficient_attention()
+            self.print_and_status_update("✅ xFormers memory‑efficient attention enabled")
+        except Exception as e:
+            # 환경이 맞지 않으면 무시하고 계속 진행
+            self.print_and_status_update(f"⚠️  xFormers 사용 불가: {e}")
+
+         # LoRA 어댑터 삽입
+        target_modules = [
+            # ── Self‑Attention ───────────────────────────────
+            "attn.to_q",         # Query
+            "attn.to_k",         # Key
+            "attn.to_v",         # Value
+            "attn.to_out.0",     # Output proj
+            "attn.to_add_out",   # Kontext residual proj
+            # ── FFN (Feed‑Forward) ───────────────────────────
+            ".ff.net.0.proj",    # FFN 1차 proj
+            ".ff.net.2",         # FFN 2차 proj
+            ".ff_context.net.0.proj",
+            ".ff_context.net.2",
+            # ── 싱글 블록 전용 proj ───────────────────────────
+            "proj_mlp",          # single_transformer_blocks.*.proj_mlp
+            "proj_out",          # single_transformer_blocks.*.proj_out & 최상위 proj_out
+                            ]    # 실제 layer 이름에 맞게 수정
+ 
+#        transformer = prepare_model_for_kbit_training(transformer)
+ 
+        lora_cfg = LoraConfig(
+            r=16,
+            lora_alpha=16,
+            target_modules=target_modules,
+        )
+
+        transformer = get_peft_model(transformer, lora_cfg)
+        if hasattr(transformer, "gradient_checkpointing_enable"):
+            transformer.gradient_checkpointing_enable()
+            self.print_and_status_update("✅ Gradient Checkpointing enabled")
+        transformer.print_trainable_parameters()
+
+        '''
         if self.model_config.quantize:
             # patch the state dict method
             patch_dequantization_on_save(transformer)
             quantization_type = get_qtype(self.model_config.qtype)
+            self.print_and_status_update("Freezing gradients before quantization")
+            transformer.requires_grad_(False)     # 핵심 한 줄
+ 
+            # 2) 양자화
             self.print_and_status_update("Quantizing transformer")
-            quantize(transformer, weights=quantization_type,
-                     **self.model_config.quantize_kwargs)
+            quantize(
+                transformer,
+                weights=quantization_type,
+                **self.model_config.quantize_kwargs
+            )
+            # 3) 필요하다면 추가 freeze 호출 (선택)
             freeze(transformer)
             transformer.to(self.device_torch)
         else:
             transformer.to(self.device_torch, dtype=dtype)
-
+        '''
         flush()
 
         self.print_and_status_update("Loading T5")
@@ -120,7 +186,8 @@ class FluxKontextModel(BaseModel):
         text_encoder_2 = T5EncoderModel.from_pretrained(
             base_model_path, subfolder="text_encoder_2", torch_dtype=dtype
         )
-        text_encoder_2.to(self.device_torch, dtype=dtype)
+        text_encoder_2.to("cpu", dtype=torch.float32).eval()
+        text_encoder_2.requires_grad_(False)        
         flush()
 
         if self.model_config.quantize_te:
@@ -135,11 +202,15 @@ class FluxKontextModel(BaseModel):
             base_model_path, subfolder="text_encoder", torch_dtype=dtype)
         tokenizer = CLIPTokenizer.from_pretrained(
             base_model_path, subfolder="tokenizer", torch_dtype=dtype)
-        text_encoder.to(self.device_torch, dtype=dtype)
+        text_encoder.to("cpu", dtype=torch.float32).eval()
+        text_encoder.requires_grad_(False)
 
         self.print_and_status_update("Loading VAE")
         vae = AutoencoderKL.from_pretrained(
             base_model_path, subfolder="vae", torch_dtype=dtype)
+        
+        vae.to("cpu", dtype=torch.float32).eval()
+        vae.requires_grad_(False)
 
         self.noise_scheduler = FluxKontextModel.get_train_scheduler()
 
@@ -167,12 +238,8 @@ class FluxKontextModel(BaseModel):
 
         flush()
         # just to make sure everything is on the right device and dtype
-        text_encoder[0].to(self.device_torch)
-        text_encoder[0].requires_grad_(False)
-        text_encoder[0].eval()
-        text_encoder[1].to(self.device_torch)
-        text_encoder[1].requires_grad_(False)
-        text_encoder[1].eval()
+        text_encoder[0].requires_grad_(False); text_encoder[0].eval()
+        text_encoder[1].requires_grad_(False); text_encoder[1].eval()
         pipe.transformer = pipe.transformer.to(self.device_torch)
         flush()
 
@@ -376,11 +443,12 @@ class FluxKontextModel(BaseModel):
     
     def save_model(self, output_path, meta, save_dtype):
         # only save the unet
-        transformer: FluxTransformer2DModel = unwrap_model(self.model)
-        transformer.save_pretrained(
-            save_directory=os.path.join(output_path, 'transformer'),
-            safe_serialization=True,
-        )
+        # LoRA 가중치만 분리 저장 (수 MB)
+        if hasattr(self.model, "save_pretrained"):
+            self.model.save_pretrained(
+                os.path.join(output_path, "lora_adapter"),
+                safe_serialization=True,
+            )
 
         meta_path = os.path.join(output_path, 'aitk_meta.yaml')
         with open(meta_path, 'w') as f:

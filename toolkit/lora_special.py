@@ -202,6 +202,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         )
         if ignore_if_contains is None:
             ignore_if_contains = []
+        ignore_if_contains += ["lokr"]
         self.ignore_if_contains = ignore_if_contains
         self.transformer_only = transformer_only
         self.base_model_ref = None

@@ -18,3 +18,16 @@ def unwrap_model(model):
     except Exception as e:
         pass
     return model
+
+import torch
+
+_orig_prepare_model = Accelerator.prepare_model
+def _safe_prepare_model(self, model, **kwargs):
+    try:
+        return _orig_prepare_model(self, model, **kwargs)
+    except TypeError as e:
+        if "device()" in str(e) and "NoneType" in str(e):
+            # CPU 파라미터가 껴 있을 때 → 그냥 model 반환
+            return model.to(self.device)
+        raise
+Accelerator.prepare_model = _safe_prepare_model
